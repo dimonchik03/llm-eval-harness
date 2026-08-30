@@ -1,0 +1,92 @@
+# Example CI wiring for a real eval run — not an enforced gate in this repo.
+#
+# Runs a fast (50-record holdout) quality eval on PRs that touch the harness and
+# posts the headline metrics as a PR comment.
+#
+# DORMANT-SAFE BY DESIGN: real eval datasets hold transcript text and are
+# git-ignored, so none ships in this repo. The guard step below skips the whole
+# job when no dataset is committed, or when the OPENAI_API_KEY secret / the
+# EVAL_PREDICTOR repository variable are unset — the workflow goes live only
+# once a fork provisions those (EVAL_PREDICTOR names your predict_fn import
+# path, e.g. "my_pipeline.eval_adapter:predict"; install that package in the
+# dependency step). Until then every run is a clean no-op (green skip).
+# Unit tests, lint and type checks run unconditionally in ci.yml.
+name: eval
+
+on:
+  pull_request:
+    paths:
+      - "eval_harness/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — dataset + secrets present?
+        id: guard
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_PREDICTOR: ${{ vars.EVAL_PREDICTOR }}
+        run: |
+          DATASET=""
+          for candidate in data/dataset_v1.holdout.jsonl data/dataset_v1.jsonl; do
+            if [ -f "$candidate" ]; then DATASET="$candidate"; break; fi
+          done
+          if [ -z "$DATASET" ]; then
+            echo "No eval dataset committed (transcripts are git-ignored) — skipping eval."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$OPENAI_API_KEY" ] || [ -z "$EVAL_PREDICTOR" ]; then
+            echo "OPENAI_API_KEY secret / EVAL_PREDICTOR variable unset — skipping eval."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "dataset=$DATASET" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.guard.outputs.run == 'true'
+        run: pip install -e ".[judge]" # plus the package providing $EVAL_PREDICTOR
+
+      - name: Run 50-record holdout subset
+        if: steps.guard.outputs.run == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -o pipefail
+          llm-eval \
+            --dataset "${{ steps.guard.outputs.dataset }}" \
+            --predictor "${{ vars.EVAL_PREDICTOR }}" \
+            --split holdout \
+            --limit 50 \
+            --concurrency 4 \
+            --judge \
+            --out eval_report.json \
+            --predictions-out eval_predictions.jsonl \
+            --fail-on-regression 0.03 | tee eval_summary.txt
+
+      - name: Post results as PR comment
+        if: always() && steps.guard.outputs.run == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.existsSync('eval_summary.txt') ? fs.readFileSync('eval_summary.txt', 'utf8') : 'eval did not produce a summary';
+            const body = ['### Eval — 50-record holdout subset', '', '```', summary.trim(), '```'].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

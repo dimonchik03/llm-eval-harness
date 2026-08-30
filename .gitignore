@@ -1,0 +1,24 @@
+# Real eval datasets hold (anonymized but still sensitive) transcript text — never commit them.
+*.jsonl
+# The synthetic demo dataset is invented data and safe to track.
+!examples/*.jsonl
+
+# Local environment / secrets
+.env*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# Run artifacts
+eval_report.json
+eval_summary.txt
+
+# OS noise
+.DS_Store
